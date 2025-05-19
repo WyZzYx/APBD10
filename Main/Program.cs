@@ -1,207 +1,147 @@
-using Microsoft.Data.SqlClient;
-using System.Data;
+using Microsoft.EntityFrameworkCore;
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+
+using Data;
+using Models;
 using DTOs;
 
 
 var builder = WebApplication.CreateBuilder(args);
-var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+
+
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"))
+);
+
+
 var app = builder.Build();
 
-app.MapGet("/api/devices", async () =>
+// Devices endpoints
+app.MapGet("/api/devices", async (AppDbContext db) =>
 {
-    var list = new List<DeviceSummaryDto>();
-    await using var conn = new SqlConnection(connectionString);
-    await conn.OpenAsync();
-    await using var cmd = new SqlCommand("SELECT Id, Name FROM Devices", conn);
-    await using var reader = await cmd.ExecuteReaderAsync();
-    while (await reader.ReadAsync())
-    {
-        list.Add(new DeviceSummaryDto
-        {
-            Id = reader.GetInt32(0),
-            Name = reader.GetString(1)
-        });
-    }
-    return Results.Ok(list);
+    var devices = await db.Devices
+        .Select(d => new DeviceSummaryDto { Id = d.Id, Name = d.Name })
+        .ToListAsync();
+    return Results.Ok(devices);
 });
 
-app.MapGet("/api/devices/{id:int}", async (int id) =>
+app.MapGet("/api/devices/{id:int}", async (int id, AppDbContext db) =>
 {
-    await using var conn = new SqlConnection(connectionString);
-    await conn.OpenAsync();
+    var device = await db.Devices
+        .Include(d => d.DeviceType)
+        .Include(d => d.DeviceEmployees)
+            .ThenInclude(de => de.Employee)
+            .ThenInclude(e => e.Person)
+        .FirstOrDefaultAsync(d => d.Id == id);
 
-    var deviceQuery = @"
-SELECT d.Id, dt.Name AS DeviceTypeName, d.IsEnabled, d.AdditionalProperties
-FROM Devices d
-JOIN DeviceTypes dt ON d.DeviceTypeId = dt.Id
-WHERE d.Id = @Id";
-    await using var cmd = new SqlCommand(deviceQuery, conn);
-    cmd.Parameters.Add("@Id", SqlDbType.Int).Value = id;
-    await using var reader = await cmd.ExecuteReaderAsync();
-    if (!await reader.ReadAsync())
+    if (device == null)
         return Results.NotFound(new { message = "Device not found." });
+
+    var currentAssignment = device.DeviceEmployees
+        .FirstOrDefault(de => de.ReturnDate == null);
 
     var dto = new DeviceDetailDto
     {
-        DeviceTypeName = reader.GetString(1),
-        IsEnabled = reader.GetBoolean(2),
-        AdditionalProperties = JsonDocument.Parse(reader.GetString(3)).RootElement,
-        CurrentEmployee = null
-    };
-    reader.Close();
-
-    var currentQuery = @"
-SELECT e.Id, p.FirstName, p.LastName
-FROM DeviceEmployees de
-JOIN Employees e ON de.EmployeeId = e.Id
-JOIN Persons p ON e.PersonId = p.Id
-WHERE de.DeviceId = @Id AND de.ReturnDate IS NULL";
-    await using var subCmd = new SqlCommand(currentQuery, conn);
-    subCmd.Parameters.Add("@Id", SqlDbType.Int).Value = id;
-    await using var subReader = await subCmd.ExecuteReaderAsync();
-    if (await subReader.ReadAsync())
-    {
-        dto.CurrentEmployee = new CurrentEmployeeDto
+        DeviceTypeName = device.DeviceType?.Name ?? string.Empty,
+        IsEnabled = device.IsEnabled,
+        AdditionalProperties = JsonDocument.Parse(device.AdditionalProperties).RootElement,
+        CurrentEmployee = currentAssignment == null ? null : new CurrentEmployeeDto
         {
-            Id = subReader.GetInt32(0),
-            FullName = $"{subReader.GetString(1)} {subReader.GetString(2)}"
-        };
-    }
+            Id = currentAssignment.Employee.Id,
+            FullName = $"{currentAssignment.Employee.Person.FirstName} {currentAssignment.Employee.Person.LastName}"
+        }
+    };
+
     return Results.Ok(dto);
 });
 
-app.MapPost("/api/devices", async (DeviceCreateDto input) =>
+app.MapPost("/api/devices", async (DeviceCreateDto input, AppDbContext db) =>
 {
-    if (string.IsNullOrWhiteSpace(input.DeviceTypeName))
-        return Results.BadRequest(new { message = "DeviceTypeName is required." });
+    var type = await db.DeviceTypes.FirstOrDefaultAsync(t => t.Name == input.DeviceTypeName);
+    if (type == null)
+        return Results.BadRequest(new { message = "Invalid device type." });
 
-    await using var conn = new SqlConnection(connectionString);
-    await conn.OpenAsync();
-    await using var tx = await conn.BeginTransactionAsync();
-    try
+    var device = new Device
     {
-        var typeCmd = new SqlCommand("SELECT Id FROM DeviceTypes WHERE Name = @Name", conn);
-        typeCmd.Parameters.Add("@Name", SqlDbType.NVarChar, 100).Value = input.DeviceTypeName;
-        var typeId = (int?)await typeCmd.ExecuteScalarAsync();
-        if (typeId is null)
-            return Results.BadRequest(new { message = "Invalid device type." });
+        Name = input.DeviceTypeName,
+        DeviceTypeId = type.Id,
+        IsEnabled = input.IsEnabled,
+        AdditionalProperties = input.AdditionalProperties.GetRawText()
+    };
 
-        var insertCmd = new SqlCommand(
-            "INSERT INTO Devices (Name, DeviceTypeId, IsEnabled, AdditionalProperties) OUTPUT INSERTED.Id VALUES (@Name, @TypeId, @Enabled, @Props)",
-            conn);
-        insertCmd.Parameters.Add("@Name", SqlDbType.NVarChar, 150).Value = input.DeviceTypeName;
-        insertCmd.Parameters.Add("@TypeId", SqlDbType.Int).Value = typeId.Value;
-        insertCmd.Parameters.Add("@Enabled", SqlDbType.Bit).Value = input.IsEnabled;
-        insertCmd.Parameters.Add("@Props", SqlDbType.NVarChar).Value = input.AdditionalProperties.GetRawText();
+    db.Devices.Add(device);
+    await db.SaveChangesAsync();
 
-        var newId = (int)await insertCmd.ExecuteScalarAsync();
-        await tx.CommitAsync();
-        return Results.Created($"/api/devices/{newId}", new { Id = newId });
-    }
-    catch
-    {
-        await tx.RollbackAsync();
-        return Results.Problem("An error occurred creating the device.");
-    }
+    return Results.Created($"/api/devices/{device.Id}", new { device.Id });
 });
 
-app.MapPut("/api/devices/{id:int}", async (int id, DeviceUpdateDto input) =>
+app.MapPut("/api/devices/{id:int}", async (int id, DeviceUpdateDto input, AppDbContext db) =>
 {
-    await using var conn = new SqlConnection(connectionString);
-    await conn.OpenAsync();
-    await using var tx = await conn.BeginTransactionAsync();
-    try
-    {
-        var existsCmd = new SqlCommand("SELECT COUNT(*) FROM Devices WHERE Id = @Id", conn);
-        existsCmd.Parameters.Add("@Id", SqlDbType.Int).Value = id;
-        var exists = (int)await existsCmd.ExecuteScalarAsync() > 0;
-        if (!exists)
-            return Results.NotFound(new { message = "Device not found." });
+    var device = await db.Devices.FindAsync(id);
+    if (device == null)
+        return Results.NotFound(new { message = "Device not found." });
 
-        var typeCmd = new SqlCommand("SELECT Id FROM DeviceTypes WHERE Name = @Name", conn);
-        typeCmd.Parameters.Add("@Name", SqlDbType.NVarChar, 100).Value = input.DeviceTypeName;
-        var typeId = (int?)await typeCmd.ExecuteScalarAsync();
-        if (typeId is null)
-            return Results.BadRequest(new { message = "Invalid device type." });
+    var type = await db.DeviceTypes.FirstOrDefaultAsync(t => t.Name == input.DeviceTypeName);
+    if (type == null)
+        return Results.BadRequest(new { message = "Invalid device type." });
 
-        var updateCmd = new SqlCommand(
-            "UPDATE Devices SET DeviceTypeId = @TypeId, IsEnabled = @Enabled, AdditionalProperties = @Props WHERE Id = @Id",
-            conn);
-        updateCmd.Parameters.Add("@TypeId", SqlDbType.Int).Value = typeId.Value;
-        updateCmd.Parameters.Add("@Enabled", SqlDbType.Bit).Value = input.IsEnabled;
-        updateCmd.Parameters.Add("@Props", SqlDbType.NVarChar).Value = input.AdditionalProperties.GetRawText();
-        updateCmd.Parameters.Add("@Id", SqlDbType.Int).Value = id;
-        await updateCmd.ExecuteNonQueryAsync();
+    device.DeviceTypeId = type.Id;
+    device.IsEnabled = input.IsEnabled;
+    device.AdditionalProperties = input.AdditionalProperties.GetRawText();
+    await db.SaveChangesAsync();
 
-        await tx.CommitAsync();
-        return Results.NoContent();
-    }
-    catch
-    {
-        await tx.RollbackAsync();
-        return Results.Problem("An error occurred updating the device.");
-    }
+    return Results.NoContent();
 });
 
-app.MapDelete("/api/devices/{id:int}", async (int id) =>
+app.MapDelete("/api/devices/{id:int}", async (int id, AppDbContext db) =>
 {
-    await using var conn = new SqlConnection(connectionString);
-    await conn.OpenAsync();
-    await using var cmd = new SqlCommand("DELETE FROM Devices WHERE Id = @Id", conn);
-    cmd.Parameters.Add("@Id", SqlDbType.Int).Value = id;
-    var rows = await cmd.ExecuteNonQueryAsync();
-    return rows > 0 ? Results.NoContent() : Results.NotFound(new { message = "Device not found." });
+    var device = await db.Devices.FindAsync(id);
+    if (device == null)
+        return Results.NotFound(new { message = "Device not found." });
+
+    db.Devices.Remove(device);
+    await db.SaveChangesAsync();
+    return Results.NoContent();
 });
 
-app.MapGet("/api/employees", async () =>
+// Employees endpoints
+app.MapGet("/api/employees", async (AppDbContext db) =>
 {
-    var list = new List<EmployeeSummaryDto>();
-    await using var conn = new SqlConnection(connectionString);
-    await conn.OpenAsync();
-    await using var cmd = new SqlCommand("SELECT e.Id, p.FirstName, p.LastName FROM Employees e JOIN Persons p ON e.PersonId = p.Id", conn);
-    await using var reader = await cmd.ExecuteReaderAsync();
-    while (await reader.ReadAsync())
-    {
-        list.Add(new EmployeeSummaryDto
+    var employees = await db.Employees
+        .Include(e => e.Person)
+        .Select(e => new EmployeeSummaryDto
         {
-            Id = reader.GetInt32(0),
-            FullName = $"{reader.GetString(1)} {reader.GetString(2)}"
-        });
-    }
-    return Results.Ok(list);
+            Id = e.Id,
+            FullName = $"{e.Person.FirstName} {e.Person.LastName}"
+        })
+        .ToListAsync();
+    return Results.Ok(employees);
 });
 
-app.MapGet("/api/employees/{id:int}", async (int id) =>
+app.MapGet("/api/employees/{id:int}", async (int id, AppDbContext db) =>
 {
-    await using var conn = new SqlConnection(connectionString);
-    await conn.OpenAsync();
+    var emp = await db.Employees
+        .Include(e => e.Person)
+        .Include(e => e.Position)
+        .FirstOrDefaultAsync(e => e.Id == id);
 
-    var query = @"
-SELECT p.PassportNumber, p.FirstName, p.MiddleName, p.LastName, p.PhoneNumber, p.Email,
-       e.Salary, pos.Id AS PositionId, pos.Name AS PositionName, e.HireDate
-FROM Employees e
-JOIN Persons p ON e.PersonId = p.Id
-JOIN Positions pos ON e.PositionId = pos.Id
-WHERE e.Id = @Id";
-    await using var cmd = new SqlCommand(query, conn);
-    cmd.Parameters.Add("@Id", SqlDbType.Int).Value = id;
-    await using var reader = await cmd.ExecuteReaderAsync();
-    if (!await reader.ReadAsync())
+    if (emp == null)
         return Results.NotFound(new { message = "Employee not found." });
 
     var dto = new EmployeeDetailDto
     {
-        PassportNumber = reader.GetString(0),
-        FirstName = reader.GetString(1),
-        MiddleName = reader.IsDBNull(2) ? null : reader.GetString(2),
-        LastName = reader.GetString(3),
-        PhoneNumber = reader.GetString(4),
-        Email = reader.GetString(5),
-        Salary = reader.GetDecimal(6),
-        Position = new PositionDto { Id = reader.GetInt32(7), Name = reader.GetString(8) },
-        HireDate = reader.GetDateTime(9)
+        PassportNumber = emp.Person.PassportNumber,
+        FirstName = emp.Person.FirstName,
+        MiddleName = emp.Person.MiddleName,
+        LastName = emp.Person.LastName,
+        PhoneNumber = emp.Person.PhoneNumber,
+        Email = emp.Person.Email,
+        Salary = emp.Salary,
+        Position = new PositionDto { Id = emp.Position.Id, Name = emp.Position.Name },
+        HireDate = emp.HireDate
     };
+
     return Results.Ok(dto);
 });
 
