@@ -1,6 +1,5 @@
 using Microsoft.EntityFrameworkCore;
 using System.Text.Json;
-using Microsoft.EntityFrameworkCore;
 
 using Data;
 using Models;
@@ -17,7 +16,6 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 
 var app = builder.Build();
 
-// Devices endpoints
 app.MapGet("/api/devices", async (AppDbContext db) =>
 {
     var devices = await db.Devices
@@ -105,7 +103,6 @@ app.MapDelete("/api/devices/{id:int}", async (int id, AppDbContext db) =>
     return Results.NoContent();
 });
 
-// Employees endpoints
 app.MapGet("/api/employees", async (AppDbContext db) =>
 {
     var employees = await db.Employees
