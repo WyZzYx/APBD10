@@ -16,9 +16,9 @@
     </ItemGroup>
 
     <ItemGroup>
-      <ProjectReference Include="..\Data\Data.csproj" />
-      <ProjectReference Include="..\DTOs\DTOs.csproj" />
-      <ProjectReference Include="..\Models\Models.csproj" />
+        <ProjectReference Include="..\Data\Data.csproj" />
+        <ProjectReference Include="..\DTOs\DTOs.csproj" />
+        <ProjectReference Include="..\Models\Models.csproj" />
     </ItemGroup>
 
 </Project>
